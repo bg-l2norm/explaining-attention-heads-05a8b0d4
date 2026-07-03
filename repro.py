@@ -157,6 +157,14 @@ def main():
 
     # ── 5. Causal head replacement ─────────────────────────────────────────
     print("\n[INFO] === Causal head replacement (perplexity) ===")
+
+    def apply_hooks(hooks, sent):
+        handles = []
+        for l, (kind, tgt, fn) in hooks.items():
+            tgt._current_sentence = sent
+            handles.append(tgt.register_forward_pre_hook(fn))
+        return handles
+
     # baseline perplexity per sentence
     def ppl_of(sent, hooks=None):
         active = sent
@@ -264,13 +272,6 @@ def main():
             tgt._current_sentence = None
             hooks[l] = ("c_proj", tgt, make_pre_hook(l))
         return hooks
-
-    def apply_hooks(hooks, sent):
-        handles = []
-        for l, (kind, tgt, fn) in hooks.items():
-            tgt._current_sentence = sent
-            handles.append(tgt.register_forward_pre_hook(fn))
-        return handles
 
     def make_baseline_hook(lookup):
         """Baseline: lower-diagonal mask on pre-c_proj output."""
