@@ -208,33 +208,6 @@ def main():
     id_ppl = np.mean([ppl_of(s, id_hooks) for s in sents])
     print(f"[INFO] Identity-hook PPL (should ≈ {base_mean:.2f}): {id_ppl:.2f}")
 
-    # Debug: compare real attention weights vs program matrix for top head
-    top_row = best.iloc[0]
-    tl, th = int(top_row["layer"]), int(top_row["head"])
-    tp = str(top_row["best_program"])
-    print(f"\n[INFO] Top head: L{tl}H{th} program={tp} IoU={top_row['best_iou']:.4f}")
-    sent0 = sents[0]
-    inp0 = tok(sent0, return_tensors="pt", truncation=True, max_length=512).to(DEVICE)
-    with torch.no_grad():
-        out0 = model(**inp0, output_attentions=True)
-    real_att = out0.attentions[tl][0, th].to(torch.float32).cpu().numpy()
-    prog_fn = progs.get(tp)
-    prog_mat = get_program_matrix(prog_fn, sent0, tok, real_att.shape[0])
-    if prog_mat is not None:
-        print(f"  sent0 tokens: {tok.tokenize(sent0)[:10]}... (n={real_att.shape[0]})")
-        print(f"  real_att row 0: {real_att[0][:5]}")
-        print(f"  prog_mat row 0: {prog_mat[0][:5]}")
-        print(f"  real_att row 5: {real_att[5][:5]}")
-        print(f"  prog_mat row 5: {prog_mat[5][:5]}")
-        print(f"  real_att row 10: {real_att[10][:5]}")
-        print(f"  prog_mat row 10: {prog_mat[10][:5]}")
-        print(f"  IoU(real, prog): {iou_score(real_att, prog_mat):.4f}")
-        # Check: what does π @ (A @ V) look like vs A @ V?
-        # Get the context output (after c_proj)
-        # The attention output is post-c_proj; we can't easily get pre-c_proj
-        # But we can check the magnitude of π @ ctx vs ctx
-    print()
-
     _debug_count = [0]
     def make_smart_hook(lookup):
         """Register hooks on c_proj (pre-projection) to modify per-head context."""
@@ -258,12 +231,6 @@ def main():
                                 t = torch.tensor(mat, device=DEVICE, dtype=m.dtype)
                                 m[:, :, h, :] = torch.matmul(t, m[:, :, h, :])
                                 applied += 1
-                                if _debug_count[0] < 1:
-                                    rs = mat.sum(axis=1)
-                                    print(f"  [DBG] L{layer_id}H{h} s={s} mat_shape={mat.shape} "
-                                          f"row_sums[min={rs.min():.3f},max={rs.max():.3f}] "
-                                          f"applied={applied}")
-                                    _debug_count[0] += 1
                 return (m.view(b, s, d),)
             return pre_hook
 
