@@ -178,12 +178,14 @@ def main():
     base_mean = float(np.mean(base_ppls))
     print(f"[INFO] GPT-2 baseline mean PPL: {base_mean:.2f}")
 
+    _debug_count = [0]
     def make_smart_hook(lookup):
         def hook(module, inp, out):
             ctx = out[0]; b, s, d = ctx.shape
             m = ctx.view(b, s, NUM_HEADS, d // NUM_HEADS).clone()
             sent = getattr(module, "_current_sentence", None)
             if sent is None: return out
+            applied = 0; skipped = 0
             for h in range(NUM_HEADS):
                 key = (module.layer_id, h)
                 if key in lookup:
@@ -193,6 +195,19 @@ def main():
                         if mat is not None:
                             t = torch.tensor(mat, device=DEVICE, dtype=m.dtype)
                             m[:, :, h, :] = torch.matmul(t, m[:, :, h, :])
+                            applied += 1
+                            if _debug_count[0] < 1:
+                                rs = mat.sum(axis=1)
+                                print(f"  [DBG] L{module.layer_id}H{h} s={s} mat_shape={mat.shape} "
+                                      f"row_sums[min={rs.min():.3f},max={rs.max():.3f}] "
+                                      f"ctx_norm={ctx.norm().item():.2f}")
+                        else:
+                            skipped += 1
+                    else:
+                        skipped += 1
+            if _debug_count[0] < 1 and applied + skipped > 0:
+                print(f"  [DBG] layer={module.layer_id} applied={applied} skipped={skipped} s={s}")
+                _debug_count[0] += 1
             return (m.view(b, s, d),) + out[1:]
         return hook
 
@@ -201,6 +216,8 @@ def main():
             ctx = out[0]; b, s, d = ctx.shape
             m = ctx.view(b, s, NUM_HEADS, d // NUM_HEADS).clone()
             mask = torch.tril(torch.ones((s, s), device=DEVICE))
+            if _debug_count[0] < 2:
+                print(f"  [DBG-BL] layer={module.layer_id} s={s} mask_sum={mask.sum().item():.0f}")
             for h in range(NUM_HEADS):
                 if (module.layer_id, h) in lookup:
                     m[:, :, h, :] = torch.matmul(mask, m[:, :, h, :])
