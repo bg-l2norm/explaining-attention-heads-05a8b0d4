@@ -178,6 +178,24 @@ def main():
     base_mean = float(np.mean(base_ppls))
     print(f"[INFO] GPT-2 baseline mean PPL: {base_mean:.2f}")
 
+    # Sanity test: identity matrix replacement should preserve PPL
+    def make_identity_hook(lookup):
+        def hook(module, inp, out):
+            ctx = out[0]; b, s, d = ctx.shape
+            m = ctx.view(b, s, NUM_HEADS, d // NUM_HEADS).clone()
+            eye = torch.eye(s, device=DEVICE, dtype=m.dtype)
+            for h in range(NUM_HEADS):
+                if (module.layer_id, h) in lookup:
+                    m[:, :, h, :] = torch.matmul(eye, m[:, :, h, :])
+            return (m.view(b, s, d),) + out[1:]
+        return hook
+
+    k1 = best.head(1)
+    lookup1 = {(int(r["layer"]), int(r["head"])): str(r["best_program"]) for _, r in k1.iterrows()}
+    rel1 = set(l for (l, _) in lookup1)
+    id_ppl = np.mean([ppl_of(s, {l: make_identity_hook(lookup1) for l in rel1}) for s in sents])
+    print(f"[INFO] Identity-hook PPL (should ≈ {base_mean:.2f}): {id_ppl:.2f}")
+
     _debug_count = [0]
     def make_smart_hook(lookup):
         def hook(module, inp, out):
