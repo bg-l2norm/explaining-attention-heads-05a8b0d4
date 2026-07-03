@@ -7,4 +7,4 @@ pip install -q -r requirements.txt
 python -m spacy download en_core_web_sm >/dev/null 2>&1 || true
 
 echo "[run.sh] running minimal GPT-2 repro"
-python repro.py
+python3 repro.py
