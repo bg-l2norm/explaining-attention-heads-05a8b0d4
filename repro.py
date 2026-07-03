@@ -163,11 +163,7 @@ def main():
         inp = tok(active, return_tensors="pt", truncation=True, max_length=512).to(DEVICE)
         handles = []
         if hooks:
-            for l, fn in hooks.items():
-                tgt = model.transformer.h[l].attn
-                tgt.layer_id = l
-                handles.append(tgt.register_forward_hook(fn))
-                tgt._current_sentence = active
+            handles = apply_hooks(hooks, active)
         with torch.no_grad():
             o = model(**inp, labels=inp["input_ids"])
         for h in handles:
@@ -180,20 +176,28 @@ def main():
 
     # Sanity test: identity matrix replacement should preserve PPL
     def make_identity_hook(lookup):
-        def hook(module, inp, out):
-            ctx = out[0]; b, s, d = ctx.shape
-            m = ctx.view(b, s, NUM_HEADS, d // NUM_HEADS).clone()
-            eye = torch.eye(s, device=DEVICE, dtype=m.dtype)
-            for h in range(NUM_HEADS):
-                if (module.layer_id, h) in lookup:
-                    m[:, :, h, :] = torch.matmul(eye, m[:, :, h, :])
-            return (m.view(b, s, d),) + out[1:]
-        return hook
+        hooks = {}
+        def make_pre_hook(layer_id):
+            def pre_hook(module, args):
+                x = args[0]
+                b, s, d = x.shape
+                m = x.view(b, s, NUM_HEADS, d // NUM_HEADS).clone()
+                eye = torch.eye(s, device=DEVICE, dtype=m.dtype)
+                for h in range(NUM_HEADS):
+                    if (layer_id, h) in lookup:
+                        m[:, :, h, :] = torch.matmul(eye, m[:, :, h, :])
+                return (m.view(b, s, d),)
+            return pre_hook
+
+        for l in set(lk[0] for lk in lookup):
+            tgt = model.transformer.h[l].attn.c_proj
+            hooks[l] = ("c_proj", tgt, make_pre_hook(l))
+        return hooks
 
     k1 = best.head(1)
     lookup1 = {(int(r["layer"]), int(r["head"])): str(r["best_program"]) for _, r in k1.iterrows()}
-    rel1 = set(l for (l, _) in lookup1)
-    id_ppl = np.mean([ppl_of(s, {l: make_identity_hook(lookup1) for l in rel1}) for s in sents])
+    id_hooks = make_identity_hook(lookup1)
+    id_ppl = np.mean([ppl_of(s, id_hooks) for s in sents])
     print(f"[INFO] Identity-hook PPL (should ≈ {base_mean:.2f}): {id_ppl:.2f}")
 
     # Debug: compare real attention weights vs program matrix for top head
@@ -225,49 +229,68 @@ def main():
 
     _debug_count = [0]
     def make_smart_hook(lookup):
-        def hook(module, inp, out):
-            ctx = out[0]; b, s, d = ctx.shape
-            m = ctx.view(b, s, NUM_HEADS, d // NUM_HEADS).clone()
-            sent = getattr(module, "_current_sentence", None)
-            if sent is None: return out
-            applied = 0; skipped = 0
-            for h in range(NUM_HEADS):
-                key = (module.layer_id, h)
-                if key in lookup:
-                    prog = progs.get(lookup[key])
-                    if prog:
-                        mat = get_program_matrix(prog, sent, tok, s)
-                        if mat is not None:
-                            t = torch.tensor(mat, device=DEVICE, dtype=m.dtype)
-                            m[:, :, h, :] = torch.matmul(t, m[:, :, h, :])
-                            applied += 1
-                            if _debug_count[0] < 1:
-                                rs = mat.sum(axis=1)
-                                print(f"  [DBG] L{module.layer_id}H{h} s={s} mat_shape={mat.shape} "
-                                      f"row_sums[min={rs.min():.3f},max={rs.max():.3f}] "
-                                      f"ctx_norm={ctx.norm().item():.2f}")
-                        else:
-                            skipped += 1
-                    else:
-                        skipped += 1
-            if _debug_count[0] < 1 and applied + skipped > 0:
-                print(f"  [DBG] layer={module.layer_id} applied={applied} skipped={skipped} s={s}")
-                _debug_count[0] += 1
-            return (m.view(b, s, d),) + out[1:]
-        return hook
+        """Register hooks on c_proj (pre-projection) to modify per-head context."""
+        hooks = {}
+        def make_pre_hook(layer_id):
+            def pre_hook(module, args):
+                x = args[0]
+                b, s, d = x.shape
+                m = x.view(b, s, NUM_HEADS, d // NUM_HEADS).clone()
+                sent = getattr(module, "_current_sentence", None)
+                if sent is None:
+                    return None
+                applied = 0
+                for h in range(NUM_HEADS):
+                    key = (layer_id, h)
+                    if key in lookup:
+                        prog = progs.get(lookup[key])
+                        if prog:
+                            mat = get_program_matrix(prog, sent, tok, s)
+                            if mat is not None:
+                                t = torch.tensor(mat, device=DEVICE, dtype=m.dtype)
+                                m[:, :, h, :] = torch.matmul(t, m[:, :, h, :])
+                                applied += 1
+                                if _debug_count[0] < 1:
+                                    rs = mat.sum(axis=1)
+                                    print(f"  [DBG] L{layer_id}H{h} s={s} mat_shape={mat.shape} "
+                                          f"row_sums[min={rs.min():.3f},max={rs.max():.3f}] "
+                                          f"applied={applied}")
+                                    _debug_count[0] += 1
+                return (m.view(b, s, d),)
+            return pre_hook
+
+        for l in set(lk[0] for lk in lookup):
+            tgt = model.transformer.h[l].attn.c_proj
+            tgt._current_sentence = None
+            hooks[l] = ("c_proj", tgt, make_pre_hook(l))
+        return hooks
+
+    def apply_hooks(hooks, sent):
+        handles = []
+        for l, (kind, tgt, fn) in hooks.items():
+            tgt._current_sentence = sent
+            handles.append(tgt.register_forward_pre_hook(fn))
+        return handles
 
     def make_baseline_hook(lookup):
-        def hook(module, inp, out):
-            ctx = out[0]; b, s, d = ctx.shape
-            m = ctx.view(b, s, NUM_HEADS, d // NUM_HEADS).clone()
-            mask = torch.tril(torch.ones((s, s), device=DEVICE))
-            if _debug_count[0] < 2:
-                print(f"  [DBG-BL] layer={module.layer_id} s={s} mask_sum={mask.sum().item():.0f}")
-            for h in range(NUM_HEADS):
-                if (module.layer_id, h) in lookup:
-                    m[:, :, h, :] = torch.matmul(mask, m[:, :, h, :])
-            return (m.view(b, s, d),) + out[1:]
-        return hook
+        """Baseline: lower-diagonal mask on pre-c_proj output."""
+        hooks = {}
+        def make_pre_hook(layer_id):
+            def pre_hook(module, args):
+                x = args[0]
+                b, s, d = x.shape
+                m = x.view(b, s, NUM_HEADS, d // NUM_HEADS).clone()
+                mask = torch.tril(torch.ones((s, s), device=DEVICE, dtype=m.dtype))
+                for h in range(NUM_HEADS):
+                    if (layer_id, h) in lookup:
+                        m[:, :, h, :] = torch.matmul(mask, m[:, :, h, :])
+                return (m.view(b, s, d),)
+            return pre_hook
+
+        for l in set(lk[0] for lk in lookup):
+            tgt = model.transformer.h[l].attn.c_proj
+            hooks[l] = ("c_proj", tgt, make_pre_hook(l))
+        return hooks
 
     sweep_rows = []
     for frac in REPLACEMENT_LEVELS:
@@ -275,14 +298,10 @@ def main():
         topk = best.head(k)
         lookup = {(int(r["layer"]), int(r["head"])): str(r["best_program"])
                   for _, r in topk.iterrows()}
-        rel_layers = set(l for (l, _) in lookup)
-        for strategy, hook_fn in [("smart", make_smart_hook(lookup)),
-                                  ("baseline", make_baseline_hook(lookup))]:
-            hooks = {l: hook_fn for l in rel_layers}
+        for strategy, hooks in [("smart", make_smart_hook(lookup)),
+                                ("baseline", make_baseline_hook(lookup))]:
             rep_ppls = []
             for sent in sents:
-                for l in rel_layers:
-                    model.transformer.h[l].attn._current_sentence = sent
                 rep_ppls.append(ppl_of(sent, hooks))
             inc = float(np.mean([(r - b) / b * 100 for r, b in zip(rep_ppls, base_ppls)]))
             sweep_rows.append({
